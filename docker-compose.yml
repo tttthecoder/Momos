@@ -1,0 +1,72 @@
+version: "3.5"
+
+services:
+  database:
+    image: mysql:8.0
+    container_name: mysql-database
+    restart: always
+    environment:
+      MYSQL_DATABASE: "${DB_DATABASE}"
+      MYSQL_USER: "${DB_USERNAME}"
+      MYSQL_PASSWORD: "${DB_PASSWORD}"
+      MYSQL_ROOT_PASSWORD: "${DB_PASSWORD}"
+
+    ports:
+      - "${DB_PORT}:${DB_PORT}"
+    volumes:
+      - ./template:/data/mysql
+    env_file:
+      - .env
+
+  redis:
+    container_name: redis-cache
+    image: redis
+    ports:
+      - 6379:6379
+
+  backend:
+    container_name: backend-service
+    restart: always
+    build:
+      context: BE
+      args:
+        NODEJS_DOCKER_IMAGE: ${NODEJS_DOCKER_IMAGE}
+        API_PORT: ${API_PORT}
+
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+      restart_policy:
+        # for debugging
+        condition: none # Do not restart the container on failure
+    env_file:
+      - .env
+    depends_on:
+      - database
+      - redis
+    ports:
+      - "${API_PORT}:${API_PORT}"
+    volumes:
+      - ./BE:/app
+      - /app/node_modules
+
+  frontend:
+    container_name: frontend-service
+    restart: always
+    build:
+      context: FE
+      args:
+        FE_PORT: ${FE_PORT}
+        NEXT_PUBLIC_BE_HOST: ${NEXT_PUBLIC_BE_HOST}
+    env_file:
+      - .env
+    depends_on:
+      - backend
+    ports:
+      - "${FE_PORT}:${FE_PORT}"
+volumes:
+  database:
+    driver: local

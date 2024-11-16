@@ -1,0 +1,142 @@
+import { TokenDto } from '@applications/dtos/authentication/token.dto';
+import { IJwtService, ITokenDto, JwtPayload } from '@domains/adapters/jwt.interface';
+import { UserTokenType } from '@domains/common/token';
+import { UserAccount, UserToken } from '@domains/entities';
+import { IUnitOfWork } from '@domains/unit-of-work/unit-of-work.service';
+import { EnvironmentConfigService } from '@infrastructures/config/environment-config/environment-config.service';
+import { UnitOfWork } from '@infrastructures/unit-of-work/unit-of-work.service';
+import { Inject, Injectable } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { TokenType } from '@shared/common/enums';
+import { JwtHelper } from '@shared/helpers/jwt.helper';
+
+@Injectable()
+export class JwtTokenService implements IJwtService {
+  constructor(
+    private readonly jwtService: JwtService,
+    @Inject(UnitOfWork)
+    private readonly unitOfWork: IUnitOfWork,
+    private readonly jwtConfig: EnvironmentConfigService,
+  ) {}
+
+  getLoggedOutCookieForJwtRefreshToken(): string {
+    const cookie = `${this.jwtConfig.getJwtRefreshCookieKey()}=; HttpOnly; SameSite=None; Secure; Path=/; Max-Age=0`;
+    return cookie;
+  }
+
+  async responseAuthWithAccessTokenAndRefreshTokenCookie(
+    userAccount: UserAccount,
+    hasVerify2FA?: boolean,
+  ): Promise<{ user: UserAccount; token: ITokenDto; refreshTokenCookie: string }> {
+    try {
+      const token: TokenDto = await this.generateTokens(userAccount, hasVerify2FA);
+
+      await this.updateOrCreateTokens(userAccount, token);
+
+      const refreshTokenCookie = this.getCookieWithJwtRefreshToken(token.refreshToken);
+
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { refreshToken, ...accessTokenReponseDto } = token;
+
+      return {
+        user: userAccount,
+        token: accessTokenReponseDto,
+        refreshTokenCookie,
+      };
+    } catch (error) {
+      console.log(error);
+    }
+  }
+
+  async checkToken(token: string, type: TokenType): Promise<JwtPayload | Partial<JwtPayload>> {
+    return await this.jwtService.verifyAsync(token, {
+      algorithms: type === TokenType.ResetPasswordToken ? ['HS256'] : ['HS512'],
+      secret: type === TokenType.AccessToken ? this.jwtConfig.getJwtSecret() : this.jwtConfig.getJwtRefreshSecret(),
+    });
+  }
+
+  async createToken(payload: JwtPayload, secret: string, expiresIn: string): Promise<string> {
+    return await this.jwtService.sign(payload, {
+      secret,
+      expiresIn,
+      algorithm: 'HS512',
+    });
+  }
+
+  private async generateTokens(userAccount: UserAccount, hasVerify2FA: boolean = false): Promise<TokenDto> {
+    const payload: JwtPayload = {
+      uuid: userAccount.uuid,
+      hasVerify2FA,
+    };
+    const tokenType = this.jwtConfig.getJwtType();
+    const accessTokenExpires = this.jwtConfig.getJwtExpirationTime();
+    const [accessToken, refreshToken] = await Promise.all([
+      this.generateJwtToken(payload),
+      this.generateJwtRefreshToken(payload),
+    ]);
+
+    return {
+      tokenType,
+      accessToken,
+      accessTokenExpires,
+      refreshToken,
+    };
+  }
+
+  private async generateJwtToken(payload: JwtPayload) {
+    const accessTokenExpires = this.jwtConfig.getJwtExpirationTime();
+    const accessTokenSecret = this.jwtConfig.getJwtSecret();
+    const token = this.createToken(payload, accessTokenSecret, accessTokenExpires);
+    return token;
+  }
+
+  private async generateJwtRefreshToken(payload: JwtPayload) {
+    const refreshTokenExpires = this.jwtConfig.getJwtRefreshExpirationTime();
+    const refreshTokenSecret = this.jwtConfig.getJwtRefreshSecret();
+    const token = this.createToken(payload, refreshTokenSecret, refreshTokenExpires);
+    return token;
+  }
+
+  private async updateOrCreateTokens(userAccount: UserAccount, tokens: TokenDto): Promise<void> {
+    const userTokens = await this.unitOfWork.getUserTokenRepository().getUserTokenListByUserAccountId(userAccount.id);
+
+    if (!userTokens || userTokens.length === 0) {
+      await this.unitOfWork.getUserTokenRepository().creates([
+        {
+          token: tokens.refreshToken,
+          type: UserTokenType.Refresh,
+          userAccountId: userAccount.id,
+          expiredAt: await JwtHelper.getExpiredDate(tokens.refreshToken),
+        },
+        {
+          token: tokens.accessToken,
+          type: UserTokenType.Access,
+          userAccountId: userAccount.id,
+          expiredAt: await JwtHelper.getExpiredDate(tokens.accessToken),
+        },
+      ]);
+    } else {
+      const accessTokenModel = new UserToken();
+      accessTokenModel.userAccountId = userAccount.id;
+      accessTokenModel.type = UserTokenType.Access;
+      accessTokenModel.token = tokens.accessToken;
+      accessTokenModel.expiredAt = await JwtHelper.getExpiredDate(tokens.accessToken);
+
+      const refreshTokenModel = new UserToken();
+      refreshTokenModel.userAccountId = userAccount.id;
+      refreshTokenModel.type = UserTokenType.Refresh;
+      refreshTokenModel.token = tokens.refreshToken;
+      refreshTokenModel.expiredAt = await JwtHelper.getExpiredDate(tokens.refreshToken);
+
+      await Promise.all([
+        this.unitOfWork.getUserTokenRepository().updateUserToken(accessTokenModel),
+        this.unitOfWork.getUserTokenRepository().updateUserToken(refreshTokenModel),
+      ]);
+    }
+  }
+
+  private getCookieWithJwtRefreshToken(refreshToken: string): string {
+    const cookie = `${this.jwtConfig.getJwtRefreshCookieKey()}=${refreshToken}; HttpOnly; SameSite=None; Secure; Path=/; Max-Age=${this.jwtConfig.getJwtRefreshTokenCookieMaxAge()}`;
+    return cookie;
+  }
+}
