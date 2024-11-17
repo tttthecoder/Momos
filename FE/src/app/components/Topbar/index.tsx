@@ -33,6 +33,7 @@ export default function TopBar() {
     onError: (error: any) => {
       // Handle error during logout, should toast here !
       console.error("Logout failed:", error);
+      dispatch(setAuthState({ token: "", username: null }));
     },
   });
 
